@@ -98,6 +98,14 @@ contract ChestOpener is ReentrancyGuard {
         shop[itemId] = ShopItem(price, available);
         emit ShopItemUpdated(itemId, price, available);
     }
+    function getAllShopItems() external view returns (ShopItem[] memory) {
+    ShopItem[] memory items = new ShopItem[](nextItemId);
+    for (uint256 i = 0; i < nextItemId; i++) {
+        items[i] = shop[i];
+    }
+    return items;
+    }
+
     /* ---------------- Buying from Shop ---------------- */
 
     function buyNFT(uint256 itemId) external nonReentrant {
