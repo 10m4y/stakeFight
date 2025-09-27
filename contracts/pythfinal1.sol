@@ -105,14 +105,14 @@ contract WizardLobbySepolia is ReentrancyGuard {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// ---------- USER FUNCTIONS ----------
     /// @notice Set or update a username for caller (required before staking)
-    function setPlayerUsername(string calldata _username) external {
-        require(bytes(_username).length > 0, "Username cannot be empty");
-        playerUsername[msg.sender] = _username;
-        emit PlayerUsernameSet(msg.sender, _username);
+    function setUsername(string calldata _name) external {
+        require(bytes(_name).length > 0, "Username cannot be empty");
+        playerUsername[msg.sender] = _name;
+        emit PlayerUsernameSet(msg.sender, _name);
     }
 //////////////////////////////////////////////////////////////////////////////////////////
     /// @notice Stake SEP-ETH equivalent to $1 USD and join lobby
-    function stakeAndJoinLobby() external payable nonReentrant {
+    function stakeAndJoin() external payable nonReentrant {
         require(bytes(playerUsername[msg.sender]).length > 0, "Must set username first");
         require(!isInLobby[msg.sender], "Already in current lobby");
         require(currentLobby.length < MAX_PLAYERS, "Lobby is full");
@@ -202,11 +202,8 @@ contract WizardLobbySepolia is ReentrancyGuard {
         return sortedPlayerAddresses;
     }
 //////////////////////////////////////////////////////////////////////////////////////////////////
-    /**
-     * @dev Compares user leaderboard with system leaderboard and distributes rewards if identical
-     * @param submittedLeaderboard User-provided leaderboard array
-     */
-    function validateLeaderboardAndDistributeRewards(address[] calldata submittedLeaderboard) 
+   
+    function distributeRewards(address[] calldata leaderboard) 
         external  
         nonReentrant 
     {
@@ -214,19 +211,19 @@ contract WizardLobbySepolia is ReentrancyGuard {
         address[] memory systemGeneratedLeaderboard = generateGameLeaderboard();
         
         // Check if arrays have the same length
-        if (submittedLeaderboard.length != systemGeneratedLeaderboard.length) {
+        if (leaderboard.length != systemGeneratedLeaderboard.length) {
             revert LeaderboardMismatch();
         }
         
         // Compare each element in both arrays
-        for (uint256 i = 0; i < submittedLeaderboard.length; i++) {
-            if (submittedLeaderboard[i] != systemGeneratedLeaderboard[i]) {
+        for (uint256 i = 0; i < leaderboard.length; i++) {
+            if (leaderboard[i] != systemGeneratedLeaderboard[i]) {
                 revert LeaderboardMismatch();
             }
         }
         
         // If we reach here, arrays are identical - distribute rewards
-        _executeRewardDistribution(submittedLeaderboard);
+        _executeRewardDistribution(leaderboard);
     }
 
     /// ---------- ADMIN FUNCTIONS ----------
