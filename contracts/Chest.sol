@@ -8,8 +8,14 @@ interface IEntropy {
     function requestV2() external payable returns (uint64);
 }
 interface IChestNFT {
-    function mint(address to) external returns (uint256);
+    function mintWithMetadata(
+        address to,
+        string memory name,
+        string memory prize,
+        string memory image
+    ) external returns (uint256);
 }
+
 
 contract ChestOpener is ReentrancyGuard {
     IEntropy public entropy;
@@ -35,8 +41,11 @@ contract ChestOpener is ReentrancyGuard {
 
 /* ---------------- NFT Shop ---------------- */
     struct ShopItem {
-        uint256 price;     // cost in coins
-        bool available;    // is this item purchasable?
+    string name;         // name of the NFT
+    string prize;        // prize description
+    string image;        // ipfs link
+    uint256 price;       // cost in coins
+    bool available;      // is this item purchasable?
     }
     mapping(uint256 => ShopItem) public shop; // itemId => ShopItem
     uint256 public nextItemId;
@@ -59,8 +68,9 @@ contract ChestOpener is ReentrancyGuard {
         string randomnessSource
     );
     event CoinsSpent(address indexed user, uint256 amount, uint256 remaining);
-    event ShopItemAdded(uint256 indexed itemId, uint256 price);
-    event ShopItemUpdated(uint256 indexed itemId, uint256 price, bool available);
+    // Fixed event declarations to match the emit statements
+    event ShopItemAdded(uint256 indexed itemId, string name, string prize, string image, uint256 price);
+    event ShopItemUpdated(uint256 indexed itemId, string name, string prize, string image, uint256 price, bool available);
     event NFTPurchased(address indexed user, uint256 itemId, uint256 tokenId, uint256 price);
 
     /* MODIFIERS */
@@ -87,17 +97,29 @@ contract ChestOpener is ReentrancyGuard {
         owner = msg.sender;
     }
     /* ---------------- Shop Management ---------------- */
-     function addShopItem(uint256 price) external onlyOwner {
-        shop[nextItemId] = ShopItem(price, true);
-        emit ShopItemAdded(nextItemId, price);
-        nextItemId++;
-    }
+    function addShopItem(
+    string memory name,
+    string memory prize,
+    string memory image,
+    uint256 price
+)    external onlyOwner {
+    shop[nextItemId] = ShopItem(name, prize, image, price, true);
+    emit ShopItemAdded(nextItemId, name, prize, image, price);
+    nextItemId++;
+}
 
-    function updateShopItem(uint256 itemId, uint256 price, bool available) external onlyOwner {
-        require(itemId < nextItemId, "Invalid itemId");
-        shop[itemId] = ShopItem(price, available);
-        emit ShopItemUpdated(itemId, price, available);
-    }
+    function updateShopItem(
+    uint256 itemId,
+    string memory name,
+    string memory prize,
+    string memory image,
+    uint256 price,
+    bool available
+) external onlyOwner {
+    require(itemId < nextItemId, "Invalid itemId");
+    shop[itemId] = ShopItem(name, prize, image, price, available);
+    emit ShopItemUpdated(itemId, name, prize, image, price, available);
+}
     function getAllShopItems() external view returns (ShopItem[] memory) {
     ShopItem[] memory items = new ShopItem[](nextItemId);
     for (uint256 i = 0; i < nextItemId; i++) {
@@ -106,22 +128,24 @@ contract ChestOpener is ReentrancyGuard {
     return items;
     }
 
-    /* ---------------- Buying from Shop ---------------- */
+/// Buy NFT and remove it from shop
+function buyNFT(uint256 itemId) external nonReentrant {
+    ShopItem memory item = shop[itemId];
+    require(item.available, "Item not available");
+    require(coins[msg.sender] >= item.price, "Not enough coins");
 
-    function buyNFT(uint256 itemId) external nonReentrant {
-        ShopItem memory item = shop[itemId];
-        require(item.available, "Item not available");
-        require(coins[msg.sender] >= item.price, "Not enough coins");
+    // Deduct coins
+    coins[msg.sender] -= item.price;
 
-        // Deduct coins
-        coins[msg.sender] -= item.price;
+    // Mark item as unavailable (sold)
+    shop[itemId].available = false;
 
-        // Mint NFT from ChestNFT
-        uint256 tokenId = chestNFT.mint(msg.sender);
+    // Mint NFT with metadata
+    uint256 tokenId = chestNFT.mintWithMetadata(msg.sender, item.name, item.prize, item.image);
 
-        emit CoinsSpent(msg.sender, item.price, coins[msg.sender]);
-        emit NFTPurchased(msg.sender, itemId, tokenId, item.price);
-    }
+    emit CoinsSpent(msg.sender, item.price, coins[msg.sender]);
+    emit NFTPurchased(msg.sender, itemId, tokenId, item.price);
+}
 
 
 
@@ -276,4 +300,3 @@ contract ChestOpener is ReentrancyGuard {
         return pending;
     }
 }
- 
