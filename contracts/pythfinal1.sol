@@ -18,184 +18,355 @@ contract WizardLobbySepolia is ReentrancyGuard {
     uint256 public constant SECOND_SHARE_BPS = 4000; // 40.00%
     uint256 public constant BPS_DENOM = 10000;
 
-    /// Require USD value = 1 USD exactly
-    uint256 public constant MINIMUM_USD = 1 * 10 ** 18; // $1 in 8 decimals (Pyth format)
+    /// Require USD value = 1 USD exactly (corrected for proper Pyth format)
+    uint256 public constant MINIMUM_USD_VALUE = 1 * 10 ** 18; // $1 in 8 decimals (Pyth format)
 
     /// Pyth price feed ID for ETH/USD
     bytes32 public constant ETH_USD_PRICE_FEED_ID = 0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace;
 
     /// ---------- STATE ----------
-    address public owner;
-    address[] public lobby;
-    mapping(address => bool) public inLobby;
-    mapping(address => string) public username;
-    mapping(address => bool) public hasStaked;
+    address public contractOwner;
+    address[] public currentLobby;
+    address[] public gameParticipants;
+    address[] public finalLeaderboard;
+    mapping(address => bool) public isInLobby;
+    mapping(address => string) public playerUsername;
+    mapping(address => bool) public hasPlayerStaked;
+    mapping(address => PlayerStats) public playerGameStats;
+    mapping(address => bool) public isParticipantRegistered;
+    uint256 public totalStakedAmount;
+    bool public areRewardsDistributed;
 
-    uint256 public totalStaked;
-    bool public rewardsDistributed;
+    struct PlayerStats {
+        uint256 totalKills;
+        uint256 totalDeaths;
+    }
 
     /// Pyth contract interface
-    IPyth public pyth;
+    IPyth public pythPriceOracle;
+
+    // Custom error for gas efficiency
+    error LeaderboardMismatch();
 
     /// ---------- EVENTS ----------
-    event UsernameSet(address indexed player, string username);
-    event PlayerStakedAndJoined(address indexed player, string username, uint256 amountWei);
-    event LobbyFull(address[] players);
-    event RewardsDistributed(address indexed winner, uint256 winnerAmount, address indexed second, uint256 secondAmount);
-    event EmergencyWithdraw(address indexed owner, uint256 amount);
+    event PlayerUsernameSet(address indexed player, string username);
+    event PlayerJoinedLobby(address indexed player, string username, uint256 stakedAmount);
+    event LobbyReachedCapacity(address[] players);
+    event GameRewardsDistributed(address indexed winner, uint256 winnerReward, address indexed runnerUp, uint256 runnerUpReward);
+    event EmergencyFundsWithdrawn(address indexed owner, uint256 amount);
+    event PlayerEliminationRecorded(address indexed killer, address indexed victim, bool isSelfElimination);
+    event LeaderboardGenerated(address[] sortedPlayers);
 
     /// ---------- CONSTRUCTOR ----------
     constructor(address _pythContract) {
-        owner = msg.sender;
-        pyth = IPyth(_pythContract);
+        contractOwner = msg.sender;
+        pythPriceOracle = IPyth(_pythContract);
     }
 
     /// ---------- MODIFIERS ----------
-    modifier onlyOwner() {
-        require(msg.sender == owner, "not owner");
+    modifier onlyContractOwner() {
+        require(msg.sender == contractOwner, "Unauthorized: not contract owner");
         _;
     }
-
+/////////////////////////////////////////////////////////////////////////////////////////////////////
     /// ---------- PRICE FUNCTIONS ----------
-    function getPrice() internal view returns (PythStructs.Price memory) {
-        return pyth.getPriceUnsafe(ETH_USD_PRICE_FEED_ID);
+    function getCurrentPrice() internal view returns (PythStructs.Price memory) {
+        return pythPriceOracle.getPriceUnsafe(ETH_USD_PRICE_FEED_ID);
     }
 
-    function getRawPrice() external view returns (int64) {
-        PythStructs.Price memory price = pyth.getPriceUnsafe(0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace);
-        return price.price;
+    function getLatestRawPrice() external view returns (int64) {
+        PythStructs.Price memory priceData = pythPriceOracle.getPriceUnsafe(ETH_USD_PRICE_FEED_ID);
+        return priceData.price;
     }
 
- function getExponent() external view returns (int32) {
-        PythStructs.Price memory price = pyth.getPriceUnsafe(0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace);
-        return price.expo;
+    function getPriceExponent() external view returns (int32) {
+        PythStructs.Price memory priceData = pythPriceOracle.getPriceUnsafe(ETH_USD_PRICE_FEED_ID);
+        return priceData.expo;
     }
+
     /// @notice Convert ETH amount to USD value (8 decimals to match Pyth format)
-    function getConversionRate(uint256 ethAmount) internal view returns (uint256) {
-        PythStructs.Price memory price = getPrice();
-        require(price.price > 0, "invalid price from oracle");
+    function calculateUSDValue(uint256 ethAmountInWei) internal view returns (uint256) {
+        PythStructs.Price memory priceData = getCurrentPrice();
+        require(priceData.price > 0, "Invalid price from oracle");
         
         // Convert price to proper format
-        uint256 adjustedPrice;
-        if (price.expo >= 0) {
-            adjustedPrice = uint256(uint64(price.price)) * (10 ** uint32(price.expo));
+        uint256 adjustedPricePerETH;
+        if (priceData.expo >= 0) {
+            adjustedPricePerETH = uint256(uint64(priceData.price)) * (10 ** uint32(priceData.expo));
         } else {
-            adjustedPrice = uint256(uint64(price.price)) / (10 ** uint32(-price.expo));
+            adjustedPricePerETH = uint256(uint64(priceData.price)) / (10 ** uint32(-priceData.expo));
         }
         
         // Calculate USD value: (ethAmount * pricePerETH) / 1e18
-        uint256 usdValue = (ethAmount * adjustedPrice) ;
-        return usdValue;
+        // Result should be in 8 decimals to match Pyth format
+        uint256 usdValueInCents = (ethAmountInWei * adjustedPricePerETH) ;
+        return usdValueInCents;
     }
-
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
     /// ---------- USER FUNCTIONS ----------
     /// @notice Set or update a username for caller (required before staking)
-    function setUsername(string calldata _name) external {
-        require(bytes(_name).length > 0, "empty name");
-        username[msg.sender] = _name;
-        emit UsernameSet(msg.sender, _name);
+    function setPlayerUsername(string calldata _username) external {
+        require(bytes(_username).length > 0, "Username cannot be empty");
+        playerUsername[msg.sender] = _username;
+        emit PlayerUsernameSet(msg.sender, _username);
     }
-
+//////////////////////////////////////////////////////////////////////////////////////////
     /// @notice Stake SEP-ETH equivalent to $1 USD and join lobby
-    function stakeAndJoin() external payable nonReentrant {
-        require(bytes(username[msg.sender]).length > 0, "set username first");
-        require(!inLobby[msg.sender], "already in lobby");
-        require(lobby.length < MAX_PLAYERS, "lobby full");
-        require(msg.value > 0, "no ETH sent");
+    function stakeAndJoinLobby() external payable nonReentrant {
+        require(bytes(playerUsername[msg.sender]).length > 0, "Must set username first");
+        require(!isInLobby[msg.sender], "Already in current lobby");
+        require(currentLobby.length < MAX_PLAYERS, "Lobby is full");
+        require(msg.value > 0, "No ETH sent");
 
-        uint256 usdValue = getConversionRate(msg.value);
-        require(usdValue >= MINIMUM_USD, "stake must be at least $1 USD");
+        uint256 usdEquivalent = calculateUSDValue(msg.value);
+        require(usdEquivalent >= MINIMUM_USD_VALUE, "Stake must be at least $1 USD");
+//
+        // Register player in lobby
+        currentLobby.push(msg.sender);
+        isInLobby[msg.sender] = true;
+        hasPlayerStaked[msg.sender] = true;
+        totalStakedAmount += msg.value;
 
-        // Register in lobby
-        lobby.push(msg.sender);
-        inLobby[msg.sender] = true;
-        hasStaked[msg.sender] = true;
-        totalStaked += msg.value;
+        emit PlayerJoinedLobby(msg.sender, playerUsername[msg.sender], msg.value);
 
-        emit PlayerStakedAndJoined(msg.sender, username[msg.sender], msg.value);
-
-        if (lobby.length == MAX_PLAYERS) {
-            emit LobbyFull(lobby);
+        if (currentLobby.length == MAX_PLAYERS) {
+            emit LobbyReachedCapacity(currentLobby);
         }
     }
-
-    /// ---------- ADMIN FUNCTIONS ----------
-    /// @notice Owner distributes rewards after match ends
-    function distributeRewards(address[] calldata leaderboard) external onlyOwner nonReentrant {
-        require(lobby.length >= MIN_PLAYERS, "not enough players");
-        require(leaderboard.length == lobby.length, "leaderboard size mismatch");
-        require(!rewardsDistributed, "already distributed");
-
-        // Verify leaderboard contains exactly the same addresses as lobby
-        for (uint256 i = 0; i < leaderboard.length; i++) {
-            require(inLobby[leaderboard[i]], "leaderboard contains non-lobby player");
+///////////////////////////////////////////////////////////////////////////////////////////////
+    function recordPlayerElimination(address killerAddress, address victimAddress) external {
+        require(victimAddress != address(0), "Victim address cannot be zero");
+        
+        bool isSelfElimination = (killerAddress == address(0) || killerAddress == victimAddress);
+        
+        // Add victim to participants array if not already registered
+        if (!isParticipantRegistered[victimAddress]) {
+            gameParticipants.push(victimAddress);
+            isParticipantRegistered[victimAddress] = true;
         }
-
-        // Check for duplicate addresses in leaderboard
-        for (uint256 i = 0; i < leaderboard.length; i++) {
-            for (uint256 j = i + 1; j < leaderboard.length; j++) {
-                require(leaderboard[i] != leaderboard[j], "duplicate address in leaderboard");
+        
+        // Update victim's death count
+        playerGameStats[victimAddress].totalDeaths++;
+        
+        // If not self-elimination, update killer's stats
+        if (!isSelfElimination) {
+            // Add killer to participants array if not already registered
+            if (!isParticipantRegistered[killerAddress]) {
+                gameParticipants.push(killerAddress);
+                isParticipantRegistered[killerAddress] = true;
+            }
+            
+            // Update killer's kill count
+            playerGameStats[killerAddress].totalKills++;
+        }
+        
+        emit PlayerEliminationRecorded(killerAddress, victimAddress, isSelfElimination);
+    }
+/////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * @dev Generate leaderboard and return addresses sorted by kills
+     * @return Array of player addresses sorted by kills in descending order
+     */
+    function generateGameLeaderboard() public returns (address[] memory) {
+        require(gameParticipants.length > 0, "No players have participated yet");
+        
+        // Create a copy of participants array for sorting
+        address[] memory sortedPlayerAddresses = new address[](gameParticipants.length);
+        for (uint i = 0; i < gameParticipants.length; i++) {
+            sortedPlayerAddresses[i] = gameParticipants[i];
+        }
+        
+        // Sort players by kills using bubble sort (descending order)
+        for (uint i = 0; i < sortedPlayerAddresses.length - 1; i++) {
+            for (uint j = 0; j < sortedPlayerAddresses.length - i - 1; j++) {
+                // Compare kills - if equal, compare deaths (fewer deaths = better rank)
+                if (playerGameStats[sortedPlayerAddresses[j]].totalKills < playerGameStats[sortedPlayerAddresses[j + 1]].totalKills ||
+                    (playerGameStats[sortedPlayerAddresses[j]].totalKills == playerGameStats[sortedPlayerAddresses[j + 1]].totalKills && 
+                     playerGameStats[sortedPlayerAddresses[j]].totalDeaths > playerGameStats[sortedPlayerAddresses[j + 1]].totalDeaths)) {
+                    
+                    // Swap addresses
+                    address tempAddress = sortedPlayerAddresses[j];
+                    sortedPlayerAddresses[j] = sortedPlayerAddresses[j + 1];
+                    sortedPlayerAddresses[j + 1] = tempAddress;
+                }
             }
         }
 
-        address winner = leaderboard[0];
-        address second = leaderboard[1];
+        // Store the leaderboard for viewing
+        delete finalLeaderboard;
+        for (uint i = 0; i < sortedPlayerAddresses.length; i++) {
+            finalLeaderboard.push(sortedPlayerAddresses[i]);
+        }
+        
+        emit LeaderboardGenerated(sortedPlayerAddresses);
+        return sortedPlayerAddresses;
+    }
+//////////////////////////////////////////////////////////////////////////////////////////////////
+    /**
+     * @dev Compares user leaderboard with system leaderboard and distributes rewards if identical
+     * @param submittedLeaderboard User-provided leaderboard array
+     */
+    function validateLeaderboardAndDistributeRewards(address[] calldata submittedLeaderboard) 
+        external  
+        nonReentrant 
+    {
+        // Get the system-generated leaderboard
+        address[] memory systemGeneratedLeaderboard = generateGameLeaderboard();
+        
+        // Check if arrays have the same length
+        if (submittedLeaderboard.length != systemGeneratedLeaderboard.length) {
+            revert LeaderboardMismatch();
+        }
+        
+        // Compare each element in both arrays
+        for (uint256 i = 0; i < submittedLeaderboard.length; i++) {
+            if (submittedLeaderboard[i] != systemGeneratedLeaderboard[i]) {
+                revert LeaderboardMismatch();
+            }
+        }
+        
+        // If we reach here, arrays are identical - distribute rewards
+        _executeRewardDistribution(submittedLeaderboard);
+    }
 
-        uint256 pool = totalStaked;
-        require(pool > 0, "empty pool");
+    /// ---------- ADMIN FUNCTIONS ----------
+    /// @notice Internal function to distribute rewards after match ends
+    function _executeRewardDistribution(address[] memory confirmedLeaderboard) internal {
+        require(currentLobby.length >= MIN_PLAYERS, "Not enough players in lobby");
+        require(confirmedLeaderboard.length == currentLobby.length, "Leaderboard size doesn't match lobby");
+        require(!areRewardsDistributed, "Rewards already distributed");
 
-        uint256 winnerAmount = (pool * WINNER_SHARE_BPS) / BPS_DENOM;
-        uint256 secondAmount = (pool * SECOND_SHARE_BPS) / BPS_DENOM;
+        // Verify leaderboard contains exactly the same addresses as lobby
+        for (uint256 i = 0; i < confirmedLeaderboard.length; i++) {
+            require(isInLobby[confirmedLeaderboard[i]], "Leaderboard contains non-lobby player");
+        }
 
-        require(winnerAmount + secondAmount <= pool, "payout overflow");
+        // Check for duplicate addresses in leaderboard
+        for (uint256 i = 0; i < confirmedLeaderboard.length; i++) {
+            for (uint256 j = i + 1; j < confirmedLeaderboard.length; j++) {
+                require(confirmedLeaderboard[i] != confirmedLeaderboard[j], "Duplicate address in leaderboard");
+            }
+        }
+
+        address gameWinner = confirmedLeaderboard[0];
+        address gameRunnerUp = confirmedLeaderboard[1];
+
+        uint256 totalPrizePool = totalStakedAmount;
+        require(totalPrizePool > 0, "Prize pool is empty");
+
+        uint256 winnerRewardAmount = (totalPrizePool * WINNER_SHARE_BPS) / BPS_DENOM;
+        uint256 runnerUpRewardAmount = (totalPrizePool * SECOND_SHARE_BPS) / BPS_DENOM;
+
+        require(winnerRewardAmount + runnerUpRewardAmount <= totalPrizePool, "Reward calculation overflow");
 
         // Mark distributed before external calls
-        rewardsDistributed = true;
+        areRewardsDistributed = true;
 
         // Send payouts
-        (bool success1,) = payable(winner).call{value: winnerAmount}("");
-        require(success1, "transfer to winner failed");
+        (bool winnerTransferSuccess,) = payable(gameWinner).call{value: winnerRewardAmount}("");
+        require(winnerTransferSuccess, "Transfer to winner failed");
 
-        (bool success2,) = payable(second).call{value: secondAmount}("");
-        require(success2, "transfer to second failed");
+        (bool runnerUpTransferSuccess,) = payable(gameRunnerUp).call{value: runnerUpRewardAmount}("");
+        require(runnerUpTransferSuccess, "Transfer to runner-up failed");
 
-        emit RewardsDistributed(winner, winnerAmount, second, secondAmount);
+        emit GameRewardsDistributed(gameWinner, winnerRewardAmount, gameRunnerUp, runnerUpRewardAmount);
 
         // Reset lobby for next game
-        _resetLobby();
+        _resetLobbyState();
+        _resetGameState();
     }
 
     /// ---------- VIEW FUNCTIONS ----------
-    function getLobbyPlayers() external view returns (address[] memory) {
-        return lobby;
+    function getCurrentLobbyPlayers() external view returns (address[] memory) {
+        return currentLobby;
     }
 
-    function getUsername(address _addr) external view returns (string memory) {
-        return username[_addr];
+    function getPlayerUsername(address _playerAddress) external view returns (string memory) {
+        return playerUsername[_playerAddress];
     }
 
     /// ---------- EMERGENCY FUNCTIONS ----------
-    function emergencyWithdraw() external onlyOwner nonReentrant {
-        uint256 balance = address(this).balance;
-        require(balance > 0, "no balance");
+    function emergencyWithdrawAllFunds() external onlyContractOwner nonReentrant {
+        uint256 contractBalance = address(this).balance;
+        require(contractBalance > 0, "No balance to withdraw");
         
-        (bool success,) = payable(owner).call{value: balance}("");
-        require(success, "withdraw failed");
+        (bool withdrawSuccess,) = payable(contractOwner).call{value: contractBalance}("");
+        require(withdrawSuccess, "Emergency withdrawal failed");
         
-        emit EmergencyWithdraw(owner, balance);
-        _resetLobby();
+        emit EmergencyFundsWithdrawn(contractOwner, contractBalance);
+        _resetLobbyState();
+    }
+
+    /**
+     * @dev View function to get the current leaderboard
+     * @return Array of player addresses sorted by kills in descending order
+     */
+    function getCurrentLeaderboard() external view returns (address[] memory) {
+        return finalLeaderboard;
+    }
+    
+    /**
+     * @dev View function to get leaderboard position of a specific rank
+     * @param rankPosition Rank position (0 = winner, 1 = second place, etc.)
+     * @return Player address at the specified position
+     */
+    function getPlayerAtRank(uint256 rankPosition) external view returns (address) {
+        require(rankPosition < finalLeaderboard.length, "Rank position out of bounds");
+        return finalLeaderboard[rankPosition];
+    }
+    
+    /**
+     * @dev Get player statistics
+     * @param playerAddress Address of the player
+     * @return kills Number of kills
+     * @return deaths Number of deaths
+     */
+    function getPlayerGameStatistics(address playerAddress) external view returns (uint256 kills, uint256 deaths) {
+        return (playerGameStats[playerAddress].totalKills, playerGameStats[playerAddress].totalDeaths);
+    }
+    
+    /**
+     * @dev Get all players who have participated
+     * @return Array of all player addresses
+     */
+    function getAllGameParticipants() external view returns (address[] memory) {
+        return gameParticipants;
+    }
+    
+    /**
+     * @dev Get total number of players
+     * @return Number of players who have participated
+     */
+    function getTotalParticipantCount() external view returns (uint256) {
+        return gameParticipants.length;
     }
 
     /// ---------- INTERNAL FUNCTIONS ----------
-    function _resetLobby() internal {
-        // Clear mappings for all lobby players
-        for (uint256 i = 0; i < lobby.length; i++) {
-            address player = lobby[i];
-            inLobby[player] = false;
-            hasStaked[player] = false;
+    function _resetGameState() internal {
+        // Reset all player stats
+        for (uint i = 0; i < gameParticipants.length; i++) {
+            address participantAddress = gameParticipants[i];
+            playerGameStats[participantAddress].totalKills = 0;
+            playerGameStats[participantAddress].totalDeaths = 0;
+            isParticipantRegistered[participantAddress] = false;
         }
-        delete lobby;
-        totalStaked = 0;
-        rewardsDistributed = false;
+        
+        // Clear the participants array
+        delete gameParticipants;
+        
+        // Clear the leaderboard
+        delete finalLeaderboard;
+    }
+    
+    function _resetLobbyState() internal {
+        // Clear mappings for all lobby players
+        for (uint256 i = 0; i < currentLobby.length; i++) {
+            address lobbyPlayer = currentLobby[i];
+            isInLobby[lobbyPlayer] = false;
+            hasPlayerStaked[lobbyPlayer] = false;
+        }
+        delete currentLobby;
+        totalStakedAmount = 0;
+        areRewardsDistributed = false;
     }
 }
